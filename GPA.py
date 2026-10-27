@@ -1,8 +1,14 @@
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from datetime import datetime
 import json
+from io import BytesIO
 import streamlit as st
 import pandas as pd
+
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 
 try:
     st.set_page_config(page_title="University GPA Calculator", page_icon="🎓", layout="wide")
@@ -162,6 +168,97 @@ try:
         record = {"timestamp": datetime.now().astimezone().isoformat(timespec="seconds"), "type": kind, **payload}
         st.session_state.history.insert(0, record)
 
+    def generate_single_pdf_report(item):
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), rightMargin=25, leftMargin=25, topMargin=25, bottomMargin=25)
+        elements = []
+        
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'TitleStyle',
+            parent=styles['Heading1'],
+            fontSize=15,
+            textColor=colors.HexColor("#1f77b4"),
+            spaceAfter=4
+        )
+        meta_style = ParagraphStyle(
+            'MetaStyle',
+            parent=styles['Normal'],
+            fontSize=10,
+            textColor=colors.HexColor("#333333"),
+            spaceAfter=10
+        )
+        
+        timestamp = item.get("timestamp", "N/A")
+        calc_type = item.get("type", "Calculation")
+        
+        elements.append(Paragraph(f"University GPA Report — {calc_type}", title_style))
+        
+        meta_text = f"<b>Timestamp:</b> {timestamp}"
+        if "sgpa" in item:
+            meta_text += f" | <b>SGPA:</b> {item['sgpa']} / 4.00"
+        elif "cgpa_after_current" in item:
+            meta_text += f" | <b>Current SGPA:</b> {item.get('current_sgpa', 'N/A')} | <b>CGPA After:</b> {item['cgpa_after_current']} / 4.00"
+        elements.append(Paragraph(meta_text, meta_style))
+        elements.append(Spacer(1, 5))
+        
+        courses = item.get("courses", [])
+        if courses:
+            table_data = [["Course", "Credits", "Input", "Rounded %", "Grade", "Grade Point", "Quality Points", "Remarks"]]
+            for c in courses:
+                table_data.append([
+                    str(c.get("Course", "")),
+                    str(c.get("Credits", "")),
+                    str(c.get("Input", "")),
+                    str(c.get("Rounded %", "")),
+                    str(c.get("Grade", "")),
+                    str(c.get("Grade Point", "")),
+                    str(c.get("Quality Points", "")),
+                    str(c.get("Remarks", ""))
+                ])
+            
+            # Append Total / Summary as the last row of the table
+            total_credits = item.get("credits", item.get("effective_credits", ""))
+            total_qp = item.get("quality_points", "")
+            final_score_label = f"SGPA: {item.get('sgpa', item.get('cgpa_after_current', ''))}" if ("sgpa" in item or "cgpa_after_current" in item) else "Total"
+            
+            table_data.append([
+                "TOTAL / SUMMARY",
+                str(total_credits),
+                "—",
+                "—",
+                "—",
+                "—",
+                str(total_qp),
+                final_score_label
+            ])
+            
+            t = Table(table_data, hAlign='LEFT', colWidths=[120, 50, 110, 65, 45, 65, 80, 220])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1f77b4")),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('ALIGN', (0, 1), (0, -1), 'LEFT'),
+                ('ALIGN', (7, 1), (7, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 5),
+                ('BACKGROUND', (0, 1), (-1, -2), colors.HexColor("#fdfdfd")),
+                # Highlight the last summary row differently
+                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor("#eaeaea")),
+                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#dcdcdc")),
+                ('FONTNAME', (0, 1), (-1, -2), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 7.5),
+                ('TOPPADDING', (0, 1), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 1), (-1, -1), 4),
+            ]))
+            elements.append(t)
+            
+        doc.build(elements)
+        buffer.seek(0)
+        return buffer.getvalue()
+
     def grade_options_for_course(course, require_pass=True):
         if course["credits"] == D1:
             start = 10 if require_pass else 0
@@ -310,12 +407,12 @@ try:
                             replace_cr += dec(s["previous_credits"])
                             replace_qp += dec(s["previous_credits"]) * dec(s["previous_gp"])
                     if replace_cr > past_credits:
-                        st.error("The credits marked for retake replacement exceed the completed credits. Check the old-attempt credits and prior totals.")
+                        st.error("The credits marked for retake replacement exceed the completed credits.")
                     else:
                         adjusted_past_cr = past_credits - replace_cr
                         adjusted_past_qp = past_qp - replace_qp
                         if adjusted_past_qp < 0:
-                            st.error("Retake replacement would make prior quality points negative. Check the old attempt GPA and prior CGPA data.")
+                            st.error("Retake replacement would make prior quality points negative.")
                         else:
                             total_cr = adjusted_past_cr + cur_cr
                             total_qp = adjusted_past_qp + cur_qp
@@ -334,13 +431,13 @@ try:
                                 rows.append({"Stage": f"Projected semester {i}", "Semester GPA": fmt(p_sgpa), "Cumulative CGPA": fmt(running_qp / running_cr), "Total credits": fmt(running_cr)})
                             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
                             st.dataframe(pd.DataFrame([subject_row(s) for s in current_courses]), use_container_width=True, hide_index=True)
-                            add_history("CGPA & Projection (Detailed)", {"current_sgpa": fmt(cur_sgpa), "cgpa_after_current": fmt(current_after), "effective_credits": fmt(total_cr), "quality_points": fmt(total_qp), "retake_replaced_credits": fmt(replace_cr), "projection": rows, "courses": [subject_row(s) for s in current_courses]})
+                            add_history("CGPA & Projection (Detailed)", {"current_sgpa": fmt(cur_sgpa), "cgpa_after_current": fmt(current_after), "effective_credits": fmt(total_cr), "quality_points": fmt(total_qp), "retake_replaced_credits": fmt(replace_cr), "projection": rows, "courses": [subject_row(s) for s in current_courses], "credits": fmt(total_cr)})
                             st.success("Calculation added to this session's history.")
 
         else:
             st.markdown("---")
             st.markdown("#### Step 2: Current Semester SGPA (Quick Mode)")
-            st.info("💡 **Quick Mode Note:** Quick mode calculates your updated CGPA directly using your overall current SGPA and credit hours. It does not perform individual retake credit replacements (use Detailed mode for retakes).")
+            st.info("💡 **Quick Mode Note:** Quick mode calculates your updated CGPA directly using your overall current SGPA and credit hours.")
             
             q1, q2 = st.columns(2)
             quick_sgpa_input = q1.number_input("Current semester SGPA (0.00–4.00)", min_value=0.0, max_value=4.0, value=3.00, step=0.01, key="quick_current_sgpa")
@@ -383,7 +480,7 @@ try:
                         rows.append({"Stage": f"Projected semester {i}", "Semester GPA": fmt(p_sgpa), "Cumulative CGPA": fmt(running_qp / running_cr), "Total credits": fmt(running_cr)})
                     
                     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                    add_history("CGPA & Projection (Quick)", {"mode": "Quick", "current_sgpa": fmt(cur_sgpa), "cgpa_after_current": fmt(current_after), "effective_credits": fmt(total_cr), "quality_points": fmt(total_qp), "projection": rows})
+                    add_history("CGPA & Projection (Quick)", {"mode": "Quick", "current_sgpa": fmt(cur_sgpa), "cgpa_after_current": fmt(current_after), "effective_credits": fmt(total_cr), "quality_points": fmt(total_qp), "projection": rows, "credits": fmt(total_cr)})
                     st.success("Quick calculation added to this session's history.")
 
     with target_tab:
@@ -431,30 +528,77 @@ try:
                         st.info(f"Maximum possible CGPA after this semester, assuming 4.00 SGPA: {fmt(max_cgpa)} / 4.00")
                     else:
                         plan, achieved_qp = build_efficient_plan(plan_courses, required_sgpa, require_pass=require_pass)
-                        st.caption("The planner uses dynamic programming to find the minimum-sum normalized score plan among available grade-point choices meeting the target.")
+                        st.caption("The planner uses dynamic programming to find the minimum-sum normalized score plan.")
                         st.dataframe(pd.DataFrame(plan), use_container_width=True, hide_index=True)
                         planned_sgpa = achieved_qp / semester_credits
                         st.success(f"Plan's estimated SGPA: {fmt(planned_sgpa)} / 4.00")
-                        add_history("Target GPA Plan", {"target_type": target_mode, "target": fmt(target_value), "required_sgpa": fmt(required_sgpa), "planned_sgpa": fmt(planned_sgpa), "courses": plan})
+                        
+                        # Format planner items into courses list for individual export compatibility
+                        planner_courses_rows = [{
+                            "Course": p["Course"], "Credits": p["Credits"], "Input": "Target Plan", 
+                            "Rounded %": "—", "Grade": p["Target Grade"], "Grade Point": p["Target GPA"], 
+                            "Quality Points": fmt(dec(p["Credits"]) * dec(p["Target GPA"])), "Remarks": p["Minimum Required Score"]
+                        } for p in plan]
+                        add_history("Target GPA Plan", {"target_type": target_mode, "target": fmt(target_value), "required_sgpa": fmt(required_sgpa), "planned_sgpa": fmt(planned_sgpa), "courses": planner_courses_rows, "credits": fmt(semester_credits), "quality_points": fmt(achieved_qp)})
 
     with history_tab:
-        st.subheader("Calculation history")
-        st.caption("History is kept for this active browser session.")
+        st.subheader("Calculation history & Individual Exports")
+        st.caption("Each calculation is saved below. You can download JSON, CSV, or download each calculation as its own separate PDF report with totals included.")
         if not st.session_state.history:
             st.info("No calculations have been saved in this session yet.")
         else:
-            st.dataframe(pd.DataFrame([{k: v for k, v in item.items() if k not in ("courses", "projection")} for item in st.session_state.history]), use_container_width=True, hide_index=True)
-            json_data = json.dumps(st.session_state.history, indent=2, default=lambda x: str(x))
-            st.download_button("Download history as JSON", data=json_data, file_name="gpa_history.json", mime="application/json")
-            csv_rows = []
-            for item in st.session_state.history:
-                base = {k: v for k, v in item.items() if k not in ("courses", "projection")}
-                if item.get("courses"):
-                    for course in item["courses"]:
-                        csv_rows.append({**base, **course})
-                else:
-                    csv_rows.append(base)
-            st.download_button("Download history as CSV", data=pd.DataFrame(csv_rows).to_csv(index=False), file_name="gpa_history.csv", mime="text/csv")
+            # Global Export Buttons
+            st.markdown("#### Global Exports")
+            g_col1, g_col2 = st.columns(2)
+            with g_col1:
+                json_data = json.dumps(st.session_state.history, indent=2, default=lambda x: str(x))
+                st.download_button("📥 Download All History (JSON)", data=json_data, file_name="gpa_history.json", mime="application/json")
+            with g_col2:
+                csv_rows = []
+                for item in st.session_state.history:
+                    base = {k: v for k, v in item.items() if k not in ("courses", "projection")}
+                    if item.get("courses"):
+                        for course in item["courses"]:
+                            csv_rows.append({**base, **course})
+                    else:
+                        csv_rows.append(base)
+                st.download_button("📥 Download All History (CSV)", data=pd.DataFrame(csv_rows).to_csv(index=False), file_name="gpa_history.csv", mime="text/csv")
+            
+            st.markdown("---")
+            st.markdown("#### Individual Calculation Reports")
+            
+            for idx, item in enumerate(st.session_state.history):
+                timestamp = item.get("timestamp", "N/A")
+                calc_type = item.get("type", "Calculation")
+                summary_label = f"#{len(st.session_state.history) - idx} | {calc_type} ({timestamp})"
+                if "sgpa" in item:
+                    summary_label += f" — SGPA: {item['sgpa']}"
+                elif "cgpa_after_current" in item:
+                    summary_label += f" — CGPA After: {item['cgpa_after_current']}"
+                
+                with st.expander(summary_label):
+                    st.write(f"**Type:** {calc_type}")
+                    st.write(f"**Timestamp:** {timestamp}")
+                    if "sgpa" in item:
+                        st.write(f"**SGPA:** {item['sgpa']} | **Credits:** {item.get('credits', 'N/A')} | **Quality Points:** {item.get('quality_points', 'N/A')}")
+                    elif "cgpa_after_current" in item:
+                        st.write(f"**Current SGPA:** {item.get('current_sgpa', 'N/A')} | **CGPA After:** {item['cgpa_after_current']} | **Effective Credits:** {item.get('effective_credits', item.get('credits', 'N/A'))}")
+                    
+                    courses = item.get("courses", [])
+                    if courses:
+                        st.dataframe(pd.DataFrame(courses), use_container_width=True, hide_index=True)
+                    
+                    # Individual PDF Download Button for this specific item
+                    pdf_bytes = generate_single_pdf_report(item)
+                    safe_filename = f"gpa_report_{calc_type.lower().replace(' ', '_')}_{idx+1}.pdf"
+                    st.download_button(
+                        label=f"📄 Download PDF for Entry #{len(st.session_state.history) - idx}",
+                        data=pdf_bytes,
+                        file_name=safe_filename,
+                        mime="application/pdf",
+                        key=f"download_pdf_{idx}"
+                    )
+
             if st.button("Clear session history", key="clear_history"):
                 st.session_state.history = []
                 st.rerun()
@@ -462,11 +606,10 @@ try:
     with policy_tab:
         st.subheader("Ready Reckoner grading table")
         st.write("The mark conversion policy is intentionally preserved: exact percentage is converted to a whole percentage using ceiling rounding, so 64.01% becomes 65%.")
-        st.write("Course input rules are also preserved: exactly 1 credit hour = direct lab GPA out of 4.00; exactly 2 credit hours = marks out of 50 converted to percentage; every other credit-hour value = marks out of 100.")
         grade_rows = [{"Rounded percentage": mark, "Grade point": fmt(gp), "Letter grade": letter, "Remarks": remarks} for mark, (gp, letter, remarks) in sorted(READY_RECKONER_TABLE.items())]
         st.dataframe(pd.DataFrame(grade_rows), use_container_width=True, hide_index=True)
-        st.caption("For direct-GPA labs, 4.00 is labelled A+ for consistency. Mark-based grades retain the exact original table.")
+        st.caption("For direct-GPA labs, 4.00 is labelled A+ for consistency.")
 except Exception as error:
-    st.error("The GPA calculator encountered an unexpected error. No result was produced for the failed operation. Check the technical details below.")
+    st.error("The GPA calculator encountered an unexpected error. No result was produced for the failed operation.")
     with st.expander("Technical error details"):
         st.exception(error)
